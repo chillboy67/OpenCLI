@@ -1,5 +1,5 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { collectPosts, parseLimit, parsePostTarget, postRows, requireSomePosts } from './utils.js';
+import { collectPosts, parseLimit, parsePostTarget, postRows, requireRows } from './utils.js';
 
 export const command = cli({
     site: 'threads',
@@ -21,7 +21,11 @@ export const command = cli({
             limit: limit + 1,
             scrolls: Math.ceil(limit / 10) + 2,
         });
-        requireSomePosts(result, 'post');
-        return postRows(result.posts, target.code, limit);
+        return requireRows(
+            postRows(result.posts, target.code, limit),
+            result,
+            'post',
+            `Post ${target.code} was not found on the rendered page.`,
+        );
     },
 });

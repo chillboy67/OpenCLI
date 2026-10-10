@@ -11,7 +11,7 @@ import {
     parseUsername,
     postRows,
     RELATED_KEYS,
-    requireSomePosts,
+    requireRows,
     searchRows,
     searchUrl,
     userRows,
@@ -110,7 +110,7 @@ describe('threads row shaping', () => {
             published_at: '1970-01-01T00:01:40Z',
         });
         expect(postRows(posts, 'MAIN1', 1)).toHaveLength(2);
-        expect(() => postRows(posts, 'MISSING', 10)).toThrow(EmptyResultError);
+        expect(postRows(posts, 'MISSING', 10)).toEqual([]);
     });
 
     it('drops related posts from search results', () => {
@@ -159,9 +159,12 @@ describe('threads argument parsing', () => {
 
 describe('threads helpers', () => {
     it('maps empty results to typed errors', () => {
-        expect(() => requireSomePosts({ posts: [], loginLink: true }, 'search')).toThrow(AuthRequiredError);
-        expect(() => requireSomePosts({ posts: [], loginLink: false }, 'search')).toThrow(EmptyResultError);
-        expect(() => requireSomePosts({ posts: [{}], loginLink: true }, 'search')).not.toThrow();
+        const raw = { posts: [{ pk: '1' }] };
+        expect(() => requireRows([], { ...raw, loginLink: true }, 'search')).toThrow(AuthRequiredError);
+        expect(() => requireRows([], { ...raw, loginLink: false }, 'search')).toThrow(EmptyResultError);
+        expect(() => requireRows([], { posts: [], loginLink: false }, 'user', 'No posts by @x'))
+            .toThrow(expect.objectContaining({ code: 'EMPTY_RESULT', hint: 'No posts by @x' }));
+        expect(requireRows([{ rank: 1 }], { posts: [], loginLink: true }, 'search')).toEqual([{ rank: 1 }]);
     });
 
     it('formats text and dates', () => {

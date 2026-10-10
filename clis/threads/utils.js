@@ -209,12 +209,17 @@ export async function collectPosts(page, url, { limit, scrolls }) {
     return result;
 }
 
-export function requireSomePosts(result, what) {
-    if (result.posts.length > 0) return;
+/**
+ * Validate the shaped rows, not the raw collector output: a payload holding
+ * only related posts or other authors' posts still yields no evidence, and
+ * must fail as a typed error instead of returning an empty success.
+ */
+export function requireRows(rows, result, what, detail = 'No matching posts were rendered; the page markup may have changed.') {
+    if (rows.length > 0) return rows;
     if (result.loginLink) {
         throw new AuthRequiredError('www.threads.com', `Threads ${what} returned nothing while logged out`);
     }
-    throw new EmptyResultError(`threads ${what}`, 'No posts were rendered; the page markup may have changed.');
+    throw new EmptyResultError(`threads ${what}`, detail);
 }
 
 /** Accept a post URL (threads.com or threads.net) or a bare shortcode. */
@@ -271,7 +276,7 @@ export function searchRows(posts, limit) {
 export function postRows(posts, code, limit) {
     const own = posts.filter((p) => !p.related);
     const main = own.find((p) => p.code === code);
-    if (!main) throw new EmptyResultError('threads post', `Post ${code} was not found on the rendered page.`);
+    if (!main) return [];
     const replies = own
         .filter((p) => p.pk !== main.pk && p.is_reply && p.taken_at >= main.taken_at)
         .sort((a, b) => a.taken_at - b.taken_at)

@@ -1,6 +1,6 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError } from '@jackwener/opencli/errors';
-import { collectPosts, parseLimit, requireSomePosts, searchRows, searchUrl } from './utils.js';
+import { collectPosts, parseLimit, requireRows, searchRows, searchUrl } from './utils.js';
 
 export const command = cli({
     site: 'threads',
@@ -24,7 +24,6 @@ export const command = cli({
             limit,
             scrolls: Math.ceil(limit / 8) + 2,
         });
-        requireSomePosts(result, 'search');
-        return searchRows(result.posts, limit);
+        return requireRows(searchRows(result.posts, limit), result, 'search');
     },
 });

@@ -1,5 +1,5 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { collectPosts, parseLimit, parseUsername, requireSomePosts, THREADS_ORIGIN, userRows } from './utils.js';
+import { collectPosts, parseLimit, parseUsername, requireRows, THREADS_ORIGIN, userRows } from './utils.js';
 
 export const command = cli({
     site: 'threads',
@@ -24,7 +24,11 @@ export const command = cli({
             limit,
             scrolls: Math.ceil(limit / 8) + 2,
         });
-        requireSomePosts(result, 'user');
-        return userRows(result.posts, username, limit, withReplies);
+        return requireRows(
+            userRows(result.posts, username, limit, withReplies),
+            result,
+            'user',
+            `No posts by @${username} were rendered.`,
+        );
     },
 });
