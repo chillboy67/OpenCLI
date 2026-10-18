@@ -24,6 +24,8 @@ export const command = cli({
             limit,
             scrolls: Math.ceil(limit / 8) + 2,
             kind: 'profile',
+            author: username,
+            withReplies,
         });
         return requireRows(
             userRows(result.posts, username, limit, withReplies),

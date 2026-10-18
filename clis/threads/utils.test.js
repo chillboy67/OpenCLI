@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ArgumentError, AuthRequiredError, EmptyResultError } from '@jackwener/opencli/errors';
 import {
     buildCollectorJs,
+    selectPosts,
     createStore,
     ingestDocument,
     ingestPayloadText,
@@ -223,5 +224,37 @@ describe('threads helpers', () => {
         expect(oneLine('abcdef', 4)).toBe('abc…');
         expect(isoDate(0)).toBe('');
         expect(isoDate(1_790_862_059)).toBe('2026-10-01T13:40:59Z');
+    });
+});
+
+describe('threads matching before the limit', () => {
+    const p = (o) => ({ pk: o.pk, code: o.pk, author: 'x', is_reply: false, media_id: '', parent: '', ...o });
+
+    it('counts only posts that belong to the requested profile', () => {
+        const posts = [
+            p({ pk: '1', kind: 'profile', author: 'other' }),
+            p({ pk: '2', kind: 'profile', author: 'me', is_reply: true }),
+            p({ pk: '3', kind: 'profile', author: 'Me' }),
+        ];
+        expect(selectPosts(posts, { kind: 'profile', author: 'me', withReplies: false }).map((x) => x.pk)).toEqual(['3']);
+        expect(selectPosts(posts, { kind: 'profile', author: 'me', withReplies: true }).map((x) => x.pk)).toEqual(['2', '3']);
+    });
+
+    it('counts a reply only when its parent is the requested post', () => {
+        const posts = [
+            p({ pk: 'm', code: 'MAIN01', kind: 'main', media_id: 'M_1' }),
+            p({ pk: 'r1', kind: 'reply', parent: 'M_1' }),
+            p({ pk: 'r2', kind: 'reply', parent: 'OTHER_9' }),
+        ];
+        expect(selectPosts(posts, { kind: 'reply', code: 'MAIN01' }).map((x) => x.pk)).toEqual(['r1']);
+        expect(selectPosts(posts, { kind: 'reply', code: 'NOPE01' })).toEqual([]);
+    });
+
+    it('scopes the XHR hook to one run and restores it', () => {
+        const js = buildCollectorJs({ limit: 5, scrolls: 2, kind: 'reply', code: 'MAIN01' });
+        expect(js).toContain('proto.send = origSend;');
+        expect(js).toContain('MAX_BUF');
+        expect(js).not.toContain('__opencliThreadsBuf');
+        expect(() => new Function(`return ${js.trim()}`)).not.toThrow();
     });
 });

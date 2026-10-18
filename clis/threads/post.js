@@ -21,6 +21,7 @@ export const command = cli({
             limit,
             scrolls: Math.ceil(limit / 10) + 2,
             kind: 'reply',
+            code: target.code,
         });
         return requireRows(
             postRows(result.posts, target.code, limit),
