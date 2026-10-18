@@ -4,16 +4,23 @@
  * Threads ships the first page of data as Relay JSON inside
  * <script type="application/json"> tags, streams later payloads (for example
  * a post's direct_replies) as additional script tags, and loads further pages
- * through XHR GraphQL responses while scrolling. The collector walks all of
- * them for objects shaped like a post (pk + code + user.username + caption)
- * and dedupes by pk.
+ * through XHR GraphQL responses while scrolling.
+ *
+ * Posts are read only from the connection that answers the command, never by
+ * collecting every post-shaped object:
+ *
+ *   search   data.searchResults.edges[].node.thread.thread_items[].post
+ *   profile  data.mediaData.edges[].node.thread_items[].post
+ *   post     data.media (the requested post itself)
+ *            data.media.text_post_app_info.direct_replies.edges[].node.posts.edges[].node
+ *
+ * Anything else under `data` (relatedPosts and other recommendation modules)
+ * is ignored by construction. Nodes are deduped by pk and keep the order in
+ * which the server delivered them, so top/recent ordering is preserved.
  */
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 
 export const THREADS_ORIGIN = 'https://www.threads.com';
-
-/** Keys whose subtree holds recommendations rather than the requested content. */
-export const RELATED_KEYS = ['relatedPosts'];
 
 export function unwrapEvaluateResult(payload) {
     if (payload && !Array.isArray(payload) && typeof payload === 'object' && 'session' in payload && 'data' in payload) {
@@ -32,20 +39,29 @@ export function parseLimit(value, fallback, { min = 1, max = 100 } = {}) {
 }
 
 /**
- * Walk a decoded Relay/GraphQL payload and add every post-shaped node to
- * `posts` (a Map keyed by pk). Nodes under one of `relatedKeys` are flagged
- * `related`; a later non-related sighting of the same pk wins.
+ * Create the accumulator shared by every payload of one page visit.
+ * Must stay self-contained: serialized into the page together with ingestDocument.
+ */
+export function createStore() {
+    return { posts: new Map(), pages: {}, seq: 0 };
+}
+
+/**
+ * Add the posts of one decoded Relay/GraphQL document to `store`.
+ * `kind` tags where a post came from: search | profile | main | reply.
+ * `store.pages[kind]` remembers the latest page_info of that connection.
  *
  * Must stay self-contained: it is serialized into the page with toString().
  */
-export function extractPosts(root, posts, relatedKeys) {
-    const skip = new Set(relatedKeys || []);
-    const add = (n, related) => {
-        const prev = posts.get(String(n.pk));
-        if (prev && (!prev.related || related)) return;
+export function ingestDocument(doc, store) {
+    const isPost = (n) => !!(n && typeof n === 'object' && n.pk && n.code && n.user && n.user.username && 'caption' in n);
+    const add = (n, kind, parent) => {
+        if (!isPost(n)) return;
+        const pk = String(n.pk);
+        if (store.posts.has(pk)) return;
         const info = n.text_post_app_info || {};
-        posts.set(String(n.pk), {
-            pk: String(n.pk),
+        store.posts.set(pk, {
+            pk,
             code: n.code,
             author: n.user.username,
             text: (n.caption && n.caption.text) || '',
@@ -56,23 +72,56 @@ export function extractPosts(root, posts, relatedKeys) {
             is_reply: !!info.is_reply,
             reply_to: (info.reply_to_author && info.reply_to_author.username) || '',
             taken_at: n.taken_at || 0,
-            related,
+            kind,
+            media_id: n.id ? String(n.id) : '',
+            parent: parent || '',
+            seq: store.seq++,
         });
     };
-    const walk = (n, depth, related) => {
-        if (!n || typeof n !== 'object' || depth > 60) return;
-        if (Array.isArray(n)) {
-            for (const x of n) walk(x, depth + 1, related);
-            return;
+    const arr = (v) => (Array.isArray(v) ? v : []);
+    const page = (kind, conn) => {
+        const info = conn && conn.page_info;
+        if (info) store.pages[kind] = { hasNext: info.has_next_page === true, cursor: info.end_cursor || '' };
+    };
+    const read = (data) => {
+        if (data.searchResults) {
+            for (const edge of arr(data.searchResults.edges)) {
+                for (const item of arr(edge && edge.node && edge.node.thread && edge.node.thread.thread_items)) add(item && item.post, 'search');
+            }
+            page('search', data.searchResults);
         }
-        if (n.pk && n.code && n.user && n.user.username && 'caption' in n) add(n, related);
-        for (const k of Object.keys(n)) {
-            const v = n[k];
-            if (v && typeof v === 'object') walk(v, depth + 1, related || skip.has(k));
+        if (data.mediaData) {
+            for (const edge of arr(data.mediaData.edges)) {
+                for (const item of arr(edge && edge.node && edge.node.thread_items)) add(item && item.post, 'profile');
+            }
+            page('profile', data.mediaData);
+        }
+        if (data.media) {
+            add(data.media, 'main');
+            const replies = data.media.text_post_app_info && data.media.text_post_app_info.direct_replies;
+            if (replies) {
+                for (const edge of arr(replies.edges)) {
+                    for (const e of arr(edge && edge.node && edge.node.posts && edge.node.posts.edges)) add(e && e.node, 'reply', data.media.id ? String(data.media.id) : '');
+                }
+                page('reply', replies);
+            }
         }
     };
-    walk(root, 0, false);
-    return posts;
+    // Relay wraps `data` in require[..][..].__bbox.result; descend through
+    // wrappers only, never into a post.
+    const walk = (n, depth) => {
+        if (!n || typeof n !== 'object' || depth > 40 || isPost(n)) return;
+        if (Array.isArray(n)) {
+            for (const x of n) walk(x, depth + 1);
+            return;
+        }
+        if (n.data && typeof n.data === 'object' && !Array.isArray(n.data)) read(n.data);
+        for (const k of Object.keys(n)) {
+            if (k !== 'data') walk(n[k], depth + 1);
+        }
+    };
+    walk(doc, 0);
+    return store;
 }
 
 /**
@@ -80,7 +129,7 @@ export function extractPosts(root, posts, relatedKeys) {
  * `for (;;);` guard and may be newline-delimited JSON chunks.
  * Must stay self-contained: it is serialized into the page with toString().
  */
-export function ingestPayloadText(text, posts, relatedKeys, extract) {
+export function ingestPayloadText(text, store, ingest) {
     if (!text || text.indexOf('"caption"') < 0) return;
     const body = text.replace(/^for \(;;\);/, '');
     for (const chunk of body.split(/\n(?=\{)/)) {
@@ -90,27 +139,32 @@ export function ingestPayloadText(text, posts, relatedKeys, extract) {
         } catch {
             continue;
         }
-        extract(parsed, posts, relatedKeys);
+        ingest(parsed, store);
     }
 }
 
 /**
  * Build the in-page collector. It waits for the Relay payload, then scrolls
  * gently (small steps with jittered pauses, so the site is not hammered) until
- * `limit` non-related posts are seen, `scrolls` rounds pass, or three rounds
- * in a row add nothing.
+ * `limit` posts of `kind` are seen, `scrolls` rounds pass, the connection
+ * reports no next page, or three rounds in a row add nothing.
+ *
+ * `stop` in the result says why it ended: limit | exhausted | stalled | scroll_cap
+ * | blocked. `blocked` is rate_limit (HTTP 429) or challenge (checkpoint URL).
  */
-export function buildCollectorJs({ limit, scrolls, relatedKeys = RELATED_KEYS }) {
+export function buildCollectorJs({ limit, scrolls, kind }) {
     return `
       (async () => {
-        const extractPosts = ${extractPosts.toString()};
+        const ingestDocument = ${ingestDocument.toString()};
         const ingestPayloadText = ${ingestPayloadText.toString()};
-        const RELATED = ${JSON.stringify(relatedKeys)};
+        const createStore = ${createStore.toString()};
+        const KIND = ${JSON.stringify(kind)};
         const LIMIT = ${Number(limit)};
         const SCROLLS = ${Number(scrolls)};
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const posts = new Map();
-        const ingest = (t) => ingestPayloadText(t, posts, RELATED, extractPosts);
+        const store = createStore();
+        const ingest = (t) => ingestPayloadText(t, store, ingestDocument);
+        const challenged = () => /^\\/(challenge|checkpoint|accounts\\/suspended)/.test(location.pathname);
 
         const scripts = () => Array.from(document.querySelectorAll('script[type="application/json"]'));
         for (let i = 0; i < 40 && !scripts().some((s) => s.textContent.indexOf('"caption"') >= 0); i++) {
@@ -129,10 +183,12 @@ export function buildCollectorJs({ limit, scrolls, relatedKeys = RELATED_KEYS })
         if (!window.__opencliThreadsHooked) {
           window.__opencliThreadsHooked = true;
           window.__opencliThreadsBuf = [];
+          window.__opencliThreadsStatus = [];
           const origSend = XMLHttpRequest.prototype.send;
           XMLHttpRequest.prototype.send = function (...args) {
             this.addEventListener('load', () => {
               try {
+                window.__opencliThreadsStatus.push(this.status);
                 if (typeof this.responseText === 'string') window.__opencliThreadsBuf.push(this.responseText);
               } catch {}
             });
@@ -140,10 +196,17 @@ export function buildCollectorJs({ limit, scrolls, relatedKeys = RELATED_KEYS })
           };
         }
 
-        const countMain = () => Array.from(posts.values()).filter((p) => !p.related).length;
+        const count = () => Array.from(store.posts.values()).filter((p) => p.kind === KIND).length;
+        const hasNext = () => !!(store.pages[KIND] && store.pages[KIND].hasNext);
         let stale = 0;
-        for (let i = 0; i < SCROLLS && countMain() < LIMIT && stale < 3; i++) {
-          const before = countMain();
+        let blocked = challenged() ? 'challenge' : '';
+        let stop = 'scroll_cap';
+        for (let i = 0; i < SCROLLS; i++) {
+          if (blocked) { stop = 'blocked'; break; }
+          if (count() >= LIMIT) { stop = 'limit'; break; }
+          if (store.pages[KIND] && !hasNext()) { stop = 'exhausted'; break; }
+          if (stale >= 3) { stop = 'stalled'; break; }
+          const before = count();
           // One jump to the bottom does not trigger the pagination query;
           // incremental scrolling does.
           for (let k = 0; k < 8; k++) {
@@ -153,13 +216,19 @@ export function buildCollectorJs({ limit, scrolls, relatedKeys = RELATED_KEYS })
           await sleep(2500 + Math.random() * 1000);
           for (const t of window.__opencliThreadsBuf.splice(0)) ingest(t);
           ingestScripts();
-          stale = countMain() === before ? stale + 1 : 0;
+          if (window.__opencliThreadsStatus.splice(0).includes(429)) blocked = 'rate_limit';
+          else if (challenged()) blocked = 'challenge';
+          stale = count() === before ? stale + 1 : 0;
           if (stale === 1) await sleep(2500);
         }
+        if (stop === 'scroll_cap' && count() >= LIMIT) stop = 'limit';
         ingestScripts();
         return {
-          posts: Array.from(posts.values()),
-          loginLink: !!document.querySelector('a[href^="/login"]'),
+          posts: Array.from(store.posts.values()),
+          pages: store.pages,
+          stop,
+          blocked,
+          loginLink: !!document.querySelector('a[href^="/login"]') || location.pathname.startsWith('/login'),
         };
       })()
     `;
@@ -199,10 +268,10 @@ async function navigate(page, url) {
     }
 }
 
-export async function collectPosts(page, url, { limit, scrolls }) {
+export async function collectPosts(page, url, { limit, scrolls, kind }) {
     await navigate(page, url);
     await page.wait(4);
-    const result = unwrapEvaluateResult(await page.evaluate(buildCollectorJs({ limit, scrolls })));
+    const result = unwrapEvaluateResult(await page.evaluate(buildCollectorJs({ limit, scrolls, kind })));
     if (!result || typeof result !== 'object' || !Array.isArray(result.posts)) {
         throw new CommandExecutionError('Unexpected Threads collector result shape.');
     }
@@ -210,16 +279,33 @@ export async function collectPosts(page, url, { limit, scrolls }) {
 }
 
 /**
- * Validate the shaped rows, not the raw collector output: a payload holding
- * only related posts or other authors' posts still yields no evidence, and
- * must fail as a typed error instead of returning an empty success.
+ * Validate the shaped rows, not the raw collector output. An empty result is
+ * a typed error: login wall, rate limit / challenge, or nothing rendered.
+ * Rows that arrived before pagination stopped are returned, with a warning on
+ * stderr saying why the list may be shorter than asked.
  */
-export function requireRows(rows, result, what, detail = 'No matching posts were rendered; the page markup may have changed.') {
-    if (rows.length > 0) return rows;
-    if (result.loginLink) {
-        throw new AuthRequiredError('www.threads.com', `Threads ${what} returned nothing while logged out`);
+export function requireRows(rows, result, what, detail = 'No matching posts were rendered; the page markup may have changed.', limit = Infinity, warn = (m) => process.stderr.write(`${m}\n`)) {
+    if (rows.length === 0) {
+        if (result.loginLink) {
+            throw new AuthRequiredError('www.threads.com', `Threads ${what} returned nothing while logged out`);
+        }
+        if (result.blocked === 'rate_limit') {
+            throw new CommandExecutionError(`Threads ${what} was rate limited (HTTP 429)`, 'Wait several minutes before retrying; slow down repeated runs.');
+        }
+        if (result.blocked === 'challenge') {
+            throw new CommandExecutionError(`Threads ${what} hit a login challenge`, 'Open threads.com in the automation browser and complete the challenge, then retry.');
+        }
+        throw new EmptyResultError(`threads ${what}`, detail);
     }
-    throw new EmptyResultError(`threads ${what}`, detail);
+    const cut = result.blocked === 'rate_limit' ? 'rate limited (HTTP 429)'
+        : result.blocked === 'challenge' ? 'interrupted by a login challenge'
+        : result.stop === 'stalled' ? 'stopped loading more pages'
+        : result.stop === 'scroll_cap' ? 'stopped at the scroll cap'
+        : '';
+    if (cut && rows.length < limit) {
+        warn(`threads ${what}: partial result, ${rows.length} of ${limit} requested; pagination ${cut}.`);
+    }
+    return rows;
 }
 
 /** Accept a post URL (threads.com or threads.net) or a bare shortcode. */
@@ -259,7 +345,7 @@ export function oneLine(text, max = 280) {
 
 export function searchRows(posts, limit) {
     return posts
-        .filter((p) => !p.related)
+        .filter((p) => p.kind === 'search')
         .slice(0, limit)
         .map((p, i) => ({
             rank: i + 1,
@@ -273,13 +359,16 @@ export function searchRows(posts, limit) {
         }));
 }
 
+/**
+ * The requested post (matched by shortcode) followed by its direct replies in
+ * delivery order. Streamed reply documents carry only the parent's media id,
+ * so a reply is accepted only when that id equals the main post's.
+ */
 export function postRows(posts, code, limit) {
-    const own = posts.filter((p) => !p.related);
-    const main = own.find((p) => p.code === code);
+    const main = posts.find((p) => p.kind === 'main' && p.code === code);
     if (!main) return [];
-    const replies = own
-        .filter((p) => p.pk !== main.pk && p.is_reply && p.taken_at >= main.taken_at)
-        .sort((a, b) => a.taken_at - b.taken_at)
+    const replies = posts
+        .filter((p) => p.kind === 'reply' && main.media_id && p.parent === main.media_id && p.pk !== main.pk)
         .slice(0, limit);
     const row = (p, type) => ({
         type,
@@ -293,11 +382,11 @@ export function postRows(posts, code, limit) {
     return [row(main, 'post'), ...replies.map((p) => row(p, p.author === main.author ? 'author-reply' : 'reply'))];
 }
 
+/** Posts on the profile feed written by `username`, in the order the profile delivered them. */
 export function userRows(posts, username, limit, withReplies) {
     const target = username.toLowerCase();
     return posts
-        .filter((p) => !p.related && p.author.toLowerCase() === target && (withReplies || !p.is_reply))
-        .sort((a, b) => b.taken_at - a.taken_at)
+        .filter((p) => p.kind === 'profile' && p.author.toLowerCase() === target && (withReplies || !p.is_reply))
         .slice(0, limit)
         .map((p, i) => ({
             rank: i + 1,

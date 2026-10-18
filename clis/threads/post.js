@@ -18,14 +18,16 @@ export const command = cli({
         const target = parsePostTarget(kwargs.target);
         const limit = parseLimit(kwargs.limit, 30, { min: 0 });
         const result = await collectPosts(page, target.url, {
-            limit: limit + 1,
+            limit,
             scrolls: Math.ceil(limit / 10) + 2,
+            kind: 'reply',
         });
         return requireRows(
             postRows(result.posts, target.code, limit),
             result,
             'post',
             `Post ${target.code} was not found on the rendered page.`,
+            limit + 1,
         );
     },
 });

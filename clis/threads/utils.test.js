@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { ArgumentError, AuthRequiredError, EmptyResultError } from '@jackwener/opencli/errors';
 import {
     buildCollectorJs,
-    extractPosts,
+    createStore,
+    ingestDocument,
     ingestPayloadText,
     isoDate,
     oneLine,
@@ -10,120 +12,165 @@ import {
     parsePostTarget,
     parseUsername,
     postRows,
-    RELATED_KEYS,
     requireRows,
     searchRows,
     searchUrl,
     userRows,
 } from './utils.js';
 
-function post({ pk, code, user, text = '', likes = 0, replies = 0, isReply = false, replyTo, takenAt = 1_790_000_000 }) {
-    return {
-        pk,
-        code,
-        user: { username: user, pk: `u${pk}` },
-        caption: text ? { text } : null,
-        like_count: likes,
-        taken_at: takenAt,
-        text_post_app_info: {
-            is_reply: isReply,
-            direct_reply_count: replies,
-            repost_count: 1,
-            quote_count: 0,
-            reply_to_author: replyTo ? { username: replyTo } : null,
-        },
-    };
+/**
+ * Fixtures are sanitized captures of real threads.com pages (logged in): users,
+ * shortcodes, ids, text and cursors are placeholders; the wrappers, containers
+ * and page_info nesting are unchanged. Each file holds the embedded script-tag
+ * documents ("scripts", in page order) and XHR GraphQL bodies ("xhr", in arrival order).
+ *   search.json   first page + one paginated searchResults response
+ *   profile.json  first page + two paginated mediaData responses
+ *   post.json     main post, streamed direct_replies script, one /api/graphql reply page
+ */
+const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8'));
+
+function ingest(name, mutate = (doc) => doc) {
+    const store = createStore();
+    const f = fixture(name);
+    for (const doc of f.scripts) ingestDocument(mutate(structuredClone(doc)), store);
+    for (const doc of f.xhr) ingestPayloadText(JSON.stringify(mutate(structuredClone(doc))), store, ingestDocument);
+    return { store, posts: [...store.posts.values()] };
 }
 
-/** Shape observed on a post page: main media, direct_replies, relatedPosts. */
-function postPageFixture() {
-    return {
-        require: [['RelayPrefetchedStreamCache', 'next', [], ['adp_x', {
-            __bbox: {
-                result: {
-                    data: {
-                        media: post({ pk: '1', code: 'MAIN1', user: 'alice', text: 'Main  post\ntext', replies: 2, takenAt: 100 }),
-                        direct_replies: { edges: [
-                            { node: { posts: { edges: [{ node: post({ pk: '3', code: 'R2', user: 'carol', text: 'second', isReply: true, replyTo: 'alice', takenAt: 300 }) }] } } },
-                            { node: { posts: { edges: [{ node: post({ pk: '2', code: 'R1', user: 'alice', text: 'author follow-up', isReply: true, replyTo: 'alice', takenAt: 200 }) }] } } },
-                        ] },
-                        relatedPosts: { threads: [{ thread_items: [{ post: post({ pk: '9', code: 'REL', user: 'spam', text: 'related', isReply: true, takenAt: 500 }) }] }] },
-                    },
-                },
-            },
-        }]]],
-    };
-}
+const codes = (rows) => rows.map((r) => r.url.split('/').pop());
 
-describe('threads payload extraction', () => {
-    it('collects post-shaped nodes and flags related subtrees', () => {
-        const posts = [...extractPosts(postPageFixture(), new Map(), RELATED_KEYS).values()];
-        expect(posts.map((p) => [p.code, p.related])).toEqual([
-            ['MAIN1', false],
-            ['R2', false],
-            ['R1', false],
-            ['REL', true],
-        ]);
-        expect(posts[1]).toMatchObject({ author: 'carol', is_reply: true, reply_to: 'alice', reposts: 1 });
+describe('threads search payloads', () => {
+    it('reads only searchResults thread_items and keeps delivery order', () => {
+        const { posts, store } = ingest('search');
+        expect(posts.every((p) => p.kind === 'search')).toBe(true);
+        expect(codes(searchRows(posts, 10))).toEqual(['CODE01', 'CODE02', 'CODE03', 'CODE04', 'CODE05']);
+        expect(searchRows(posts, 2).map((r) => r.rank)).toEqual([1, 2]);
+        expect(store.pages.search).toEqual({ hasNext: true, cursor: 'CURSOR_03' });
     });
 
-    it('prefers a non-related sighting of the same pk', () => {
-        const posts = new Map();
-        extractPosts({ relatedPosts: [post({ pk: '5', code: 'X', user: 'bob', text: 'x' })] }, posts, RELATED_KEYS);
-        expect(posts.get('5').related).toBe(true);
-        extractPosts({ edges: [post({ pk: '5', code: 'X', user: 'bob', text: 'x' })] }, posts, RELATED_KEYS);
-        expect(posts.get('5').related).toBe(false);
+    it('dedupes a post delivered again by the paginated response', () => {
+        const f = fixture('search');
+        const nodes = (doc) => JSON.stringify(doc).split('"caption"').length - 1;
+        expect(nodes(f.scripts) + nodes(f.xhr)).toBe(6);
+        expect(ingest('search').posts).toHaveLength(5);
+    });
+});
+
+describe('threads profile payloads', () => {
+    it('reads mediaData thread_items in server order and filters by author', () => {
+        const { posts, store } = ingest('profile');
+        expect(posts.every((p) => p.kind === 'profile')).toBe(true);
+        const own = userRows(posts, 'USER_02', 50, true);
+        expect(codes(own)).toEqual(posts.map((p) => p.code));
+        expect(userRows(posts, 'user_02', 50, false).every((r) => !r.is_reply)).toBe(true);
+        expect(userRows(posts, 'user_02', 50, false).length).toBeLessThan(own.length);
+        expect(store.pages.profile.hasNext).toBe(true);
     });
 
+    it('does not return another profile as the requested user', () => {
+        expect(userRows(ingest('profile').posts, 'someone_else', 10, true)).toEqual([]);
+    });
+});
+
+describe('threads post payloads', () => {
+    it('returns the requested post followed by its direct replies in delivery order', () => {
+        const { posts, store } = ingest('post');
+        const rows = postRows(posts, 'CODE01', 50);
+        expect(rows[0]).toMatchObject({ type: 'post', author: 'user_02', url: 'https://www.threads.com/@user_02/post/CODE01' });
+        expect(codes(rows.slice(1))).toEqual(posts.filter((p) => p.kind === 'reply').map((p) => p.code));
+        expect(rows.slice(1).every((r) => r.type === 'reply' || r.type === 'author-reply')).toBe(true);
+        expect(postRows(posts, 'CODE01', 3)).toHaveLength(4);
+        expect(store.pages.reply.hasNext).toBe(true);
+    });
+
+    it('requires the main post identity', () => {
+        const { posts } = ingest('post');
+        expect(postRows(posts, 'CODE02', 10)).toEqual([]);
+        expect(postRows(posts, 'MISSING', 10)).toEqual([]);
+    });
+
+    it('dedupes streamed documents that arrive twice', () => {
+        const f = fixture('post');
+        const store = createStore();
+        for (const doc of [...f.scripts, ...f.scripts]) ingestDocument(structuredClone(doc), store);
+        for (const doc of [...f.xhr, ...f.xhr]) ingestPayloadText(JSON.stringify(doc), store, ingestDocument);
+        expect(store.posts.size).toBe(ingest('post').store.posts.size);
+    });
+
+    it('ignores relatedPosts and other recommendation modules under data', () => {
+        const related = {
+            threads: [{ thread_items: [{ post: { pk: '1', code: 'REL', user: { username: 'spam' }, caption: { text: 'rec' }, text_post_app_info: { is_reply: true } } }] }],
+        };
+        const { posts } = ingest('post', (doc) => {
+            const data = doc.require?.[0]?.[3]?.[0]?.__bbox?.require?.[0]?.[3]?.[0]?.__bbox?.result?.data;
+            if (data?.media && !data.media.text_post_app_info?.direct_replies) {
+                data.relatedPosts = related;
+                data.recommended = related;
+            }
+            return doc;
+        });
+        expect(posts.map((p) => p.code)).not.toContain('REL');
+        expect(postRows(posts, 'CODE01', 50).map((r) => r.author)).not.toContain('spam');
+    });
+
+    it('does not attach replies that belong to another post', () => {
+        const { posts } = ingest('post', (doc) => {
+            const walk = (n) => {
+                if (Array.isArray(n)) n.forEach(walk);
+                else if (n && typeof n === 'object') {
+                    if (n.media && !n.media.pk) n.media.id = 'OTHER_MEDIA_ID';
+                    Object.values(n).forEach(walk);
+                }
+            };
+            walk(doc);
+            return doc;
+        });
+        expect(postRows(posts, 'CODE01', 10)).toHaveLength(1);
+    });
+});
+
+describe('threads payload decoding', () => {
     it('decodes guarded and newline-delimited GraphQL bodies', () => {
-        const posts = new Map();
-        const a = JSON.stringify({ data: { node: post({ pk: '1', code: 'A', user: 'a', text: 'one' }) } });
-        const b = JSON.stringify({ data: { node: post({ pk: '2', code: 'B', user: 'b', text: 'two' }) } });
-        ingestPayloadText(`for (;;);${a}\n${b}`, posts, RELATED_KEYS, extractPosts);
-        ingestPayloadText('{"no":"posts here"}', posts, RELATED_KEYS, extractPosts);
-        ingestPayloadText('not json "caption"', posts, RELATED_KEYS, extractPosts);
-        expect([...posts.keys()]).toEqual(['1', '2']);
+        const store = createStore();
+        const node = (pk, code) => ({ pk, code, user: { username: code }, caption: { text: code } });
+        const a = JSON.stringify({ data: { searchResults: { edges: [{ node: { thread: { thread_items: [{ post: node('1', 'A') }] } } }] } } });
+        const b = JSON.stringify({ data: { searchResults: { edges: [{ node: { thread: { thread_items: [{ post: node('2', 'B') }] } } }] } } });
+        ingestPayloadText(`for (;;);${a}\n${b}`, store, ingestDocument);
+        ingestPayloadText('{"no":"posts here"}', store, ingestDocument);
+        ingestPayloadText('not json "caption"', store, ingestDocument);
+        expect([...store.posts.keys()]).toEqual(['1', '2']);
     });
 
-    it('embeds the shared extractor in the collector script', () => {
-        const js = buildCollectorJs({ limit: 5, scrolls: 2 });
-        expect(js).toContain('const extractPosts = function extractPosts');
+    it('embeds the shared extractor in a parseable collector script', () => {
+        const js = buildCollectorJs({ limit: 5, scrolls: 2, kind: 'search' });
+        expect(js).toContain('const ingestDocument = function ingestDocument');
         expect(js).toContain('const LIMIT = 5;');
-        expect(js).toContain('["relatedPosts"]');
+        expect(js).toContain('const KIND = "search";');
         expect(() => new Function(`return ${js.trim()}`)).not.toThrow();
     });
 });
 
-describe('threads row shaping', () => {
-    const posts = [...extractPosts(postPageFixture(), new Map(), RELATED_KEYS).values()];
+describe('threads partial results and blocking', () => {
+    const rows = [{ rank: 1 }, { rank: 2 }];
 
-    it('returns the main post followed by replies in time order', () => {
-        const rows = postRows(posts, 'MAIN1', 10);
-        expect(rows.map((r) => [r.type, r.author])).toEqual([
-            ['post', 'alice'],
-            ['author-reply', 'alice'],
-            ['reply', 'carol'],
-        ]);
-        expect(rows[0]).toMatchObject({
-            text: 'Main post text',
-            url: 'https://www.threads.com/@alice/post/MAIN1',
-            published_at: '1970-01-01T00:01:40Z',
-        });
-        expect(postRows(posts, 'MAIN1', 1)).toHaveLength(2);
-        expect(postRows(posts, 'MISSING', 10)).toEqual([]);
+    it('warns when pagination stopped before the limit', () => {
+        const warnings = [];
+        const warn = (m) => warnings.push(m);
+        expect(requireRows(rows, { stop: 'stalled' }, 'search', undefined, 5, warn)).toBe(rows);
+        requireRows(rows, { stop: 'scroll_cap' }, 'search', undefined, 5, warn);
+        requireRows(rows, { stop: 'blocked', blocked: 'rate_limit' }, 'search', undefined, 5, warn);
+        requireRows(rows, { stop: 'blocked', blocked: 'challenge' }, 'search', undefined, 5, warn);
+        expect(warnings).toHaveLength(4);
+        expect(warnings[0]).toContain('2 of 5');
+        expect(warnings[2]).toContain('429');
     });
 
-    it('drops related posts from search results', () => {
-        const rows = searchRows(posts, 10);
-        expect(rows.map((r) => r.rank)).toEqual([1, 2, 3]);
-        expect(rows.some((r) => r.author === 'spam')).toBe(false);
-    });
-
-    it('keeps only the requested author and hides replies by default', () => {
-        expect(userRows(posts, 'ALICE', 10, false).map((r) => r.url)).toEqual([
-            'https://www.threads.com/@alice/post/MAIN1',
-        ]);
-        expect(userRows(posts, 'alice', 10, true).map((r) => r.is_reply)).toEqual([true, false]);
+    it('stays quiet when the feed is exhausted or the limit was reached', () => {
+        const warnings = [];
+        const warn = (m) => warnings.push(m);
+        requireRows(rows, { stop: 'exhausted' }, 'search', undefined, 5, warn);
+        requireRows(rows, { stop: 'limit' }, 'search', undefined, 2, warn);
+        expect(warnings).toEqual([]);
     });
 });
 
@@ -162,6 +209,10 @@ describe('threads helpers', () => {
         const raw = { posts: [{ pk: '1' }] };
         expect(() => requireRows([], { ...raw, loginLink: true }, 'search')).toThrow(AuthRequiredError);
         expect(() => requireRows([], { ...raw, loginLink: false }, 'search')).toThrow(EmptyResultError);
+        expect(() => requireRows([], { ...raw, blocked: 'rate_limit' }, 'search'))
+            .toThrow(expect.objectContaining({ code: 'COMMAND_EXEC', message: expect.stringContaining('429') }));
+        expect(() => requireRows([], { ...raw, blocked: 'challenge' }, 'search'))
+            .toThrow(expect.objectContaining({ code: 'COMMAND_EXEC', message: expect.stringContaining('challenge') }));
         expect(() => requireRows([], { posts: [], loginLink: false }, 'user', 'No posts by @x'))
             .toThrow(expect.objectContaining({ code: 'EMPTY_RESULT', hint: 'No posts by @x' }));
         expect(requireRows([{ rank: 1 }], { posts: [], loginLink: true }, 'search')).toEqual([{ rank: 1 }]);

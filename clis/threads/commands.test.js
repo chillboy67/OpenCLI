@@ -5,10 +5,10 @@ import './search.js';
 import './post.js';
 import './user.js';
 
-function collected({ pk, code, author, related = false, isReply = false, takenAt = 100 }) {
+function collected({ pk, code, author, kind, isReply = false, takenAt = 100, mediaId = '', parent = '' }) {
     return {
         pk, code, author, text: `${author} text`, likes: 1, replies: 0, reposts: 0, quotes: 0,
-        is_reply: isReply, reply_to: '', taken_at: takenAt, related,
+        is_reply: isReply, reply_to: '', taken_at: takenAt, kind, media_id: mediaId, parent,
     };
 }
 
@@ -25,13 +25,14 @@ function run(name, payload, kwargs) {
     return getRegistry().get(`threads/${name}`).func(fakePage(payload), kwargs);
 }
 
-const ONLY_RELATED = [
-    collected({ pk: '1', code: 'REL1', author: 'spam', related: true }),
-    collected({ pk: '2', code: 'REL2', author: 'zuck', related: true }),
+// Posts the collector may have seen that are not the requested evidence.
+const OTHER_KIND = [
+    collected({ pk: '1', code: 'REL1', author: 'spam', kind: 'reply', parent: 'OTHER' }),
+    collected({ pk: '2', code: 'REL2', author: 'zuck', kind: 'search' }),
 ];
-const ONLY_OTHER_AUTHORS = [
-    collected({ pk: '3', code: 'A1', author: 'alice' }),
-    collected({ pk: '4', code: 'B1', author: 'bob' }),
+const OTHER_AUTHORS = [
+    collected({ pk: '3', code: 'A1', author: 'alice', kind: 'profile' }),
+    collected({ pk: '4', code: 'B1', author: 'bob', kind: 'profile' }),
 ];
 
 describe('threads command registry', () => {
@@ -54,35 +55,53 @@ describe('threads command registry', () => {
 });
 
 describe('threads empty evidence stays a typed failure', () => {
-    it('search with only related posts fails instead of returning []', async () => {
-        await expect(run('search', { posts: ONLY_RELATED, loginLink: false }, { query: 'coffee' }))
+    it('search without search results fails instead of returning []', async () => {
+        await expect(run('search', { posts: [OTHER_AUTHORS[0]], loginLink: false }, { query: 'coffee' }))
             .rejects.toBeInstanceOf(EmptyResultError);
-        await expect(run('search', { posts: ONLY_RELATED, loginLink: true }, { query: 'coffee' }))
+        await expect(run('search', { posts: [], loginLink: true }, { query: 'coffee' }))
             .rejects.toBeInstanceOf(AuthRequiredError);
     });
 
     it('user with only other authors fails instead of returning []', async () => {
-        await expect(run('user', { posts: ONLY_OTHER_AUTHORS, loginLink: false }, { username: 'zuck' }))
-            .rejects.toMatchObject({ code: 'EMPTY_RESULT', hint: 'No posts by @zuck were rendered.' });
-        await expect(run('user', { posts: ONLY_OTHER_AUTHORS, loginLink: true }, { username: 'zuck' }))
+        await expect(run('user', { posts: OTHER_AUTHORS, loginLink: false }, { username: 'zuck' }))
+            .rejects.toMatchObject({ code: 'EMPTY_RESULT', hint: 'No posts by @zuck were found in the profile feed.' });
+        await expect(run('user', { posts: OTHER_AUTHORS, loginLink: true }, { username: 'zuck' }))
             .rejects.toBeInstanceOf(AuthRequiredError);
     });
 
-    it('user with only related posts by the requested author fails', async () => {
-        await expect(run('user', { posts: ONLY_RELATED, loginLink: false }, { username: 'zuck' }))
+    it('user ignores posts that are not in the profile feed', async () => {
+        await expect(run('user', { posts: OTHER_KIND, loginLink: false }, { username: 'zuck' }))
             .rejects.toBeInstanceOf(EmptyResultError);
     });
 
-    it('post whose target only appears as a related post fails', async () => {
-        const posts = [collected({ pk: '9', code: 'TARGET', author: 'alice', related: true })];
+    it('post whose target is not the main media fails', async () => {
+        const posts = [collected({ pk: '9', code: 'TARGET', author: 'alice', kind: 'reply', parent: 'M' })];
         await expect(run('post', { posts, loginLink: false }, { target: 'TARGET' }))
             .rejects.toMatchObject({ code: 'EMPTY_RESULT', hint: 'Post TARGET was not found on the rendered page.' });
         await expect(run('post', { posts, loginLink: true }, { target: 'TARGET' }))
             .rejects.toBeInstanceOf(AuthRequiredError);
     });
 
+    it('rate limiting and challenges are reported, not shown as empty', async () => {
+        await expect(run('search', { posts: [], loginLink: false, blocked: 'rate_limit' }, { query: 'x' }))
+            .rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+        await expect(run('user', { posts: [], loginLink: false, blocked: 'challenge' }, { username: 'x' }))
+            .rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    });
+
+    it('returns the main post and only its own replies', async () => {
+        const posts = [
+            collected({ pk: '1', code: 'MAIN01', author: 'alice', kind: 'main', mediaId: 'M' }),
+            collected({ pk: '2', code: 'R1', author: 'bob', kind: 'reply', isReply: true, parent: 'M', takenAt: 300 }),
+            collected({ pk: '3', code: 'R0', author: 'carol', kind: 'reply', isReply: true, parent: 'M', takenAt: 200 }),
+            collected({ pk: '4', code: 'X', author: 'dave', kind: 'reply', isReply: true, parent: 'OTHER' }),
+        ];
+        const rows = await run('post', { posts, loginLink: false }, { target: 'MAIN01' });
+        expect(rows.map((r) => r.url.split('/').pop())).toEqual(['MAIN01', 'R1', 'R0']);
+    });
+
     it('returns rows when matching evidence exists', async () => {
-        const rows = await run('user', { posts: ONLY_OTHER_AUTHORS, loginLink: true }, { username: 'alice' });
+        const rows = await run('user', { posts: OTHER_AUTHORS, loginLink: true }, { username: 'alice' });
         expect(rows.map((r) => r.url)).toEqual(['https://www.threads.com/@alice/post/A1']);
     });
 });

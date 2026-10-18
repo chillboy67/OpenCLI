@@ -23,12 +23,14 @@ export const command = cli({
         const result = await collectPosts(page, url, {
             limit,
             scrolls: Math.ceil(limit / 8) + 2,
+            kind: 'profile',
         });
         return requireRows(
             userRows(result.posts, username, limit, withReplies),
             result,
             'user',
-            `No posts by @${username} were rendered.`,
+            `No posts by @${username} were found in the profile feed.`,
+            limit,
         );
     },
 });

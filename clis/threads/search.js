@@ -23,7 +23,8 @@ export const command = cli({
         const result = await collectPosts(page, searchUrl(query, kwargs.sort), {
             limit,
             scrolls: Math.ceil(limit / 8) + 2,
+            kind: 'search',
         });
-        return requireRows(searchRows(result.posts, limit), result, 'search');
+        return requireRows(searchRows(result.posts, limit), result, 'search', undefined, limit);
     },
 });
